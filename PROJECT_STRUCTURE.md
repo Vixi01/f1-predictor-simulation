@@ -22,19 +22,19 @@ f1-performance-predictor/
 │       └── team_features.csv         # Team/constructor features
 │
 ├── notebooks/
-│   ├── 01_data_collection.ipynb      # ✅ READY - Fetch data from Ergast API
-│   ├── 02_eda.ipynb                  # TODO - Exploratory data analysis
-│   ├── 03_feature_engineering.ipynb  # TODO - Create track/driver features
-│   ├── 04_modeling.ipynb             # TODO - Build predictive models
-│   └── 05_simulation.ipynb           # TODO - Monte Carlo simulation
+│   ├── 01_data_collection.ipynb      # Fetch data from Ergast API
+│   ├── 02_eda.ipynb                  # Exploratory data analysis
+│   ├── 03_feature_engineering.ipynb  # Feature engineering (21 features)
+│   ├── 04_modeling.ipynb             # Predictive modeling (Ridge, RF, XGBoost)
+│   └── 05_simulation.ipynb           # Monte Carlo race simulation (10,000 runs)
 │
 ├── src/
-│   ├── __init__.py                   # Make src a package
-│   ├── data_pipeline.py              # ✅ READY - Data loading utilities
-│   ├── feature_engineering.py        # TODO - Feature creation functions
-│   ├── models.py                     # TODO - ML model classes
-│   ├── simulation.py                 # TODO - Monte Carlo simulation
-│   └── utils.py                      # TODO - Helper functions
+│   ├── __init__.py                   # Package init
+│   ├── data_pipeline.py              # Data loading utilities
+│   ├── feature_engineering.py        # Feature creation functions
+│   ├── models.py                     # ML model classes and evaluation
+│   ├── simulation.py                 # Monte Carlo race simulation engine
+│   └── utils.py                      # Helper functions
 │
 ├── tests/
 │   ├── __init__.py
@@ -49,15 +49,15 @@ f1-performance-predictor/
 │   └── predictions/                  # Model predictions
 │
 ├── docs/                             # Additional documentation
-│   ├── methodology.md                # TODO - Detailed methodology
-│   ├── results.md                    # TODO - Results and findings
-│   └── references.md                 # TODO - Data sources and citations
+│   ├── methodology.md                # Detailed methodology
+│   ├── results.md                    # Results and findings
+│   └── references.md                 # Data sources and citations
 │
-├── .gitignore                        # ✅ READY - Git ignore file
-├── requirements.txt                  # ✅ READY - Python dependencies
-├── README.md                         # ✅ READY - Project overview
-├── QUICK_START.md                    # ✅ READY - Getting started guide
-└── SETUP_INSTRUCTIONS.md             # ✅ READY - Setup guide
+├── .gitignore
+├── requirements.txt
+├── README.md
+├── QUICK_START.md
+└── SETUP_INSTRUCTIONS.md
 ```
 
 ## File Purposes
@@ -175,77 +175,14 @@ f1-performance-predictor/
 - `upcoming_race_predictions.csv` - Predictions for next race
 - `historical_predictions.csv` - Backtest results
 
-## Development Workflow
-
-### Phase 1: Setup (Week 1)
-1. Install dependencies: `pip install -r requirements.txt`
-2. Run `01_data_collection.ipynb`
-3. Verify data files in `data/raw/`
-
-### Phase 2: EDA (Week 1-2)
-1. Create `02_eda.ipynb`
-2. Analyze distributions and patterns
-3. Document findings in notebook
-
-### Phase 3: Feature Engineering (Week 2-3)
-1. Research track characteristics
-2. Create `03_feature_engineering.ipynb`
-3. Implement `feature_engineering.py`
-4. Save features to `data/features/`
-
-### Phase 4: Modeling (Week 3-4)
-1. Create `04_modeling.ipynb`
-2. Implement `models.py`
-3. Train and evaluate models
-4. Save best models to `outputs/models/`
-
-### Phase 5: Simulation (Week 4-5)
-1. Create `05_simulation.ipynb`
-2. Implement `simulation.py`
-3. Run Monte Carlo simulations
-4. Generate probability distributions
-
-### Phase 6: Finalization (Week 5-6)
-1. Create dashboard (optional)
-2. Write documentation in `docs/`
-3. Polish README and presentation materials
-4. Prepare portfolio deliverables
-
-## Git Workflow
+## Quick Start
 
 ```bash
-# Initial setup
-git init
-git add .
-git commit -m "Initial project structure"
-
-# Create GitHub repo and push
-git remote add origin https://github.com/yourusername/f1-performance-predictor.git
-git push -u origin main
-
-# Regular workflow
-git add .
-git commit -m "Descriptive message"
-git push
+pip install -r requirements.txt
+jupyter notebook notebooks/
+# Run notebooks in order: 01 → 02 → 03 → 04 → 05
 ```
-
-## Key Milestones
-
-- [ ] Week 1: Data collected and explored
-- [ ] Week 2: Features engineered
-- [ ] Week 3: Models trained and validated
-- [ ] Week 4: Simulation complete
-- [ ] Week 5: Dashboard/deliverables ready
-- [ ] Week 6: Documentation finalized
-
-## Next Immediate Steps
-
-1. ✅ Project structure created
-2. ✅ Documentation written
-3. Run `01_data_collection.ipynb` ← **YOU ARE HERE**
-4. Explore data manually
-5. Create `02_eda.ipynb`
 
 ---
 
-**This structure provides a professional, production-ready foundation for your portfolio project.**
+**Part of the data science portfolio at [github.com/Vixi01](https://github.com/Vixi01)**
