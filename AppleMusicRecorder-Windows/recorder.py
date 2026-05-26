@@ -249,6 +249,16 @@ def on_track_changed(track: Optional[TrackInfo]):
                 _finalize(temp, old_track, interrupted)
         return
 
+    # Skip if we're joining the song mid-way — recording would be incomplete
+    if track.position_sec > 1:
+        print(f"[skip] {track.title} — already {track.position_sec:.0f}s in, waiting for full play")
+        if _db:
+            _db.mark_incomplete(track.artist, track.album, track.title,
+                                "", "joined mid-song, needs full play from start")
+        _current_track = track
+        update_tray_title(f"[skip] {track.artist} – {track.title}")
+        return
+
     # Skip very short tracks (interludes, skits, ad jingles)
     if track.duration_sec > 0 and track.duration_sec < MIN_TRACK_DURATION_SEC:
         print(f"[skip] {track.title} — too short ({track.duration_sec:.0f}s)")

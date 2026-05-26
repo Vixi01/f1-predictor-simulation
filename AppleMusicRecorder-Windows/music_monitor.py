@@ -22,6 +22,7 @@ class TrackInfo:
     artist: str
     album: str
     duration_sec: float = 0.0
+    position_sec: float = 0.0
     artwork_data: Optional[bytes] = field(default=None, repr=False)
 
     def __eq__(self, other):
@@ -185,7 +186,7 @@ class MusicMonitor:
             return
 
         candidate = TrackInfo(title=title, artist=artist, album=album,
-                              duration_sec=duration_sec)
+                              duration_sec=duration_sec, position_sec=position_sec)
 
         if candidate != self._current:
             # New song: reset seek tracking BEFORE emitting to prevent false seeks
