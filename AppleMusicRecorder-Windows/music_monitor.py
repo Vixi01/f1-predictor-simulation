@@ -191,8 +191,11 @@ class MusicMonitor:
         if candidate != self._current:
             # New song: reset seek tracking BEFORE emitting to prevent false seeks
             self._seek_tracking_active = False
-            artwork = self._fetch_artwork(artist, album, title)
+            artwork, itunes_duration = self._fetch_track_data(artist, album, title)
             candidate.artwork_data = artwork
+            # Prefer iTunes duration over SMTC (SMTC often returns 0)
+            if itunes_duration > 0 and candidate.duration_sec == 0:
+                candidate.duration_sec = itunes_duration
             self._emit_track(candidate)
             if is_playing:
                 self._prev_pos_sec  = position_sec
@@ -252,24 +255,40 @@ class MusicMonitor:
     # ── Artwork ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _fetch_artwork(artist: str, album: str, title: str) -> Optional[bytes]:
+    def _fetch_track_data(artist: str, album: str, title: str) -> tuple[Optional[bytes], float]:
+        """Returns (artwork_bytes, duration_sec) from iTunes API. Either can be None/0 on failure."""
         try:
-            term = f"{artist} {album}".strip() or title
+            term = f"{artist} {title}".strip()
             resp = requests.get(
                 "https://itunes.apple.com/search",
-                params={"term": term, "media": "music", "entity": "album", "limit": 1},
+                params={"term": term, "media": "music", "entity": "song", "limit": 5},
                 timeout=5,
             )
             resp.raise_for_status()
             results = resp.json().get("results", [])
             if not results:
-                return None
-            url = results[0].get("artworkUrl100", "")
+                return None, 0.0
+
+            # Pick the best match — prefer exact title match
+            result = next(
+                (r for r in results if r.get("trackName", "").lower() == title.lower()),
+                results[0]
+            )
+
+            duration_sec = result.get("trackTimeMillis", 0) / 1000.0
+
+            url = result.get("artworkUrl100", "")
             if not url:
-                return None
+                return None, duration_sec
             url = url.replace("100x100bb", "1000x1000bb")
             img_resp = requests.get(url, timeout=8)
             img_resp.raise_for_status()
-            return img_resp.content
+            return img_resp.content, duration_sec
+
         except Exception:
-            return None
+            return None, 0.0
+
+    @staticmethod
+    def _fetch_artwork(artist: str, album: str, title: str) -> Optional[bytes]:
+        artwork, _ = MusicMonitor._fetch_track_data(artist, album, title)
+        return artwork
