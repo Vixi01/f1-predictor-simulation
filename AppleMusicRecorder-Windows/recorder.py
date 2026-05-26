@@ -32,12 +32,9 @@ from session_guard import SessionGuard, ContaminatingSession
 
 SAVE_DIR = str(Path.home() / "Music" / "Apple Music Recordings")
 
-# A recording is "verified" if its duration is within this many seconds of
-# the expected track duration from SMTC.
-DURATION_TOLERANCE_SEC = 3.0
-
-# If a track has no SMTC duration (0), we can't verify — save it anyway.
-ALLOW_UNVERIFIED_DURATION = True
+DURATION_TOLERANCE_SEC  = 3.0   # verified if recorded duration ± this matches SMTC
+ALLOW_UNVERIFIED_DURATION = True # save even when SMTC provides no duration
+MIN_TRACK_DURATION_SEC  = 30    # skip tracks shorter than this (interludes/skits)
 
 
 # ── State ───────────────────────────────────────────────────────────────────────
@@ -56,6 +53,12 @@ _guard: Optional[SessionGuard] = None
 
 # ── Capture factory (tries process loopback, falls back to system loopback) ────
 
+def _on_silence_detected() -> None:
+    msg = "No audio detected — check Apple Music is routed to VB-Cable."
+    print(f"[warn] {msg}")
+    _notify(msg, "Apple Music Recorder — No Audio")
+
+
 def _make_capture(save_dir: str) -> AudioCapture:
     try:
         from process_capture import ProcessAudioCapture, find_apple_music_pid
@@ -66,7 +69,7 @@ def _make_capture(save_dir: str) -> AudioCapture:
             return cap
     except Exception as e:
         print(f"[capture] Per-process loopback unavailable: {e}")
-    cap = AudioCapture(save_dir)
+    cap = AudioCapture(save_dir, on_silence=_on_silence_detected)
     print("[capture] Using system-wide WASAPI loopback (fallback)")
     return cap
 
@@ -86,7 +89,7 @@ def _start_recording(track: TrackInfo):
         except Exception as e:
             print(f"[capture] Primary capture failed ({e}), falling back to system loopback")
             try:
-                cap  = AudioCapture(SAVE_DIR)
+                cap  = AudioCapture(SAVE_DIR, on_silence=_on_silence_detected)
                 temp = cap.start()
                 print("[capture] Using system-wide WASAPI loopback (fallback)")
             except Exception as e2:
@@ -100,6 +103,7 @@ def _start_recording(track: TrackInfo):
             _db.mark_recording(track.artist, track.album, track.title,
                                track.duration_sec, temp)
         print(f"[recording] started -> {Path(temp).name}")
+        _set_tray_recording(True)
         if _guard:
             _guard.check_now()
             _guard.start()
@@ -116,6 +120,7 @@ def _stop_recording(reason: str = "natural end") -> Optional[tuple]:
         was_interrupted = _recording_interrupted
         _recording = False
         print(f"[recording] stopped ({reason})")
+    _set_tray_recording(False)
     if _guard:
         _guard.stop()
     return temp, track, was_interrupted
@@ -144,6 +149,7 @@ def _discard_recording(reason: str):
         temp = _capture.stop()
         _recording = False
         _recording_interrupted = True
+    _set_tray_recording(False)
     if _guard:
         _guard.stop()
     if temp:
@@ -243,6 +249,13 @@ def on_track_changed(track: Optional[TrackInfo]):
                 _finalize(temp, old_track, interrupted)
         return
 
+    # Skip very short tracks (interludes, skits, ad jingles)
+    if track.duration_sec > 0 and track.duration_sec < MIN_TRACK_DURATION_SEC:
+        print(f"[skip] {track.title} — too short ({track.duration_sec:.0f}s)")
+        _current_track = track
+        update_tray_title(f"[skip] {track.artist} – {track.title}")
+        return
+
     # Check DB — skip if already verified
     if _db:
         should, reason = _db.should_record(track.artist, track.album, track.title)
@@ -305,12 +318,65 @@ def update_tray_title(title: str):
         _tray_icon.title = title
 
 
+def _set_tray_recording(active: bool):
+    if _tray_icon:
+        try:
+            _tray_icon.icon = _make_icon(active)
+        except Exception:
+            pass
+
+
 def _notify(message: str, title: str = "Apple Music Recorder"):
     if _tray_icon:
         try:
             _tray_icon.notify(message, title)
         except Exception:
             pass
+
+
+def _retry_untagged(save_dir: str):
+    """On startup, find *_untagged.flac files and attempt to re-tag them."""
+    folder = Path(save_dir)
+    untagged = list(folder.glob("*_untagged.flac"))
+    if not untagged:
+        return
+    print(f"[startup] Found {len(untagged)} untagged file(s), retrying...")
+    recovered = 0
+    for path in untagged:
+        try:
+            result = metadata_writer.retag_untagged_file(path, folder)
+            if result is not None:
+                recovered += 1
+                print(f"[startup] re-tagged: {result.name}")
+            else:
+                print(f"[startup] could not parse filename: {path.name}")
+        except Exception as e:
+            print(f"[startup] re-tag error {path.name}: {e}")
+    print(f"[startup] Re-tagged {recovered}/{len(untagged)} file(s).")
+
+
+def _export_playlist(save_dir: str) -> Optional[Path]:
+    """Write an M3U playlist of all FLAC recordings. Returns the playlist path."""
+    from mutagen.flac import FLAC as _FLAC
+    import soundfile as _sf
+    folder = Path(save_dir)
+    flacs  = sorted(folder.glob("*.flac"))
+    if not flacs:
+        return None
+    playlist_path = folder / "Apple Music Recordings.m3u"
+    lines = ["#EXTM3U"]
+    for f in flacs:
+        try:
+            audio    = _FLAC(str(f))
+            artist   = (audio.get("artist") or [""])[0]
+            title    = (audio.get("title")  or [f.stem])[0]
+            duration = int(_sf.info(str(f)).duration)
+        except Exception:
+            artist, title, duration = "", f.stem, -1
+        lines.append(f"#EXTINF:{duration},{artist} - {title}")
+        lines.append(str(f))
+    playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return playlist_path
 
 
 def _on_open_folder(icon, item):
@@ -325,6 +391,18 @@ def _on_show_quality(icon, item):
     if _quality_report.warning:
         msg += "\n\n" + _quality_report.warning
     icon.notify(msg, "Audio Quality Check")
+
+
+def _on_export_playlist(icon, item):
+    try:
+        result = _export_playlist(SAVE_DIR)
+        if result is None:
+            icon.notify("No recordings found.", "Export Playlist")
+            return
+        icon.notify(f"Saved: {result.name}", "Export Playlist")
+        os.startfile(SAVE_DIR)
+    except Exception as e:
+        icon.notify(f"Export failed: {e}", "Export Playlist")
 
 
 def _on_show_incomplete(icon, item):
@@ -357,6 +435,8 @@ def run_tray():
         title="Apple Music Recorder — idle",
         menu=pystray.Menu(
             pystray.MenuItem("Open recordings folder", _on_open_folder),
+            pystray.MenuItem("Export playlist (M3U)",  _on_export_playlist),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Audio quality check",    _on_show_quality),
             pystray.MenuItem("Incomplete recordings",  _on_show_incomplete),
             pystray.Menu.SEPARATOR,
@@ -406,6 +486,8 @@ def main():
     print(f"[init] Saving recordings to: {SAVE_DIR}")
 
     _db = RecordingDB(SAVE_DIR)
+
+    _retry_untagged(SAVE_DIR)
 
     # Session guard runs silently — VB-Cable isolates recording so warnings
     # about other apps are not actionable.

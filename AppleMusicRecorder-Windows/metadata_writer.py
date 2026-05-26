@@ -13,7 +13,7 @@ from typing import Callable, Optional
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import PictureType
 
-from music_monitor import TrackInfo
+from music_monitor import TrackInfo, MusicMonitor
 
 
 def process(temp_path: str, track: Optional[TrackInfo], save_directory: str,
@@ -27,6 +27,48 @@ def process(temp_path: str, track: Optional[TrackInfo], save_directory: str,
     t.start()
 
 
+def retag_untagged_file(untagged_path: Path, save_dir: Path, db=None) -> Optional[Path]:
+    """Re-tag an *_untagged.flac file by parsing artist/album/title from its name.
+    Fetches missing artwork from iTunes. Returns the renamed path on success, None on failure."""
+    stem = untagged_path.stem
+    if stem.endswith("_untagged"):
+        stem = stem[: -len("_untagged")]
+
+    parts = stem.rsplit(" - ", 2)
+    if len(parts) != 3:
+        return None
+    artist, album, title = (p.strip() for p in parts)
+
+    try:
+        audio = FLAC(str(untagged_path))
+        audio["title"]  = [title]
+        audio["artist"] = [artist]
+        audio["album"]  = [album]
+
+        art_path = save_dir / f"{stem}.jpg"
+        artwork_data: Optional[bytes] = None
+
+        if not art_path.exists():
+            artwork_data = MusicMonitor._fetch_artwork(artist, album, title)
+
+        if artwork_data:
+            pic = Picture()
+            pic.type = PictureType.COVER_FRONT
+            pic.mime = "image/jpeg"
+            pic.data = artwork_data
+            audio.add_picture(pic)
+            art_path.write_bytes(artwork_data)
+
+        audio.save()
+
+        final_path = _replace_path(save_dir / f"{stem}.flac")
+        os.replace(str(untagged_path), str(final_path))
+        return final_path
+
+    except Exception:
+        return None
+
+
 def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
                       save_directory: str, on_saved: Optional[Callable]):
     if not os.path.exists(temp_path):
@@ -34,8 +76,8 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
 
     save_dir   = Path(save_directory)
     base_name  = track.safe_filename if track else _timestamp_name()
-    final_path = _unique_path(save_dir / f"{base_name}.flac")
-    art_path   = _unique_path(save_dir / f"{base_name}.jpg")
+    final_path = _replace_path(save_dir / f"{base_name}.flac")
+    art_path   = save_dir / f"{base_name}.jpg"
 
     try:
         audio = FLAC(temp_path)
@@ -64,9 +106,9 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
                 pass
 
     except Exception as e:
-        fallback = _unique_path(save_dir / f"{base_name}_untagged.flac")
+        fallback = save_dir / f"{base_name}_untagged.flac"
         try:
-            os.replace(temp_path, fallback)
+            os.replace(temp_path, str(fallback))
         except Exception:
             pass
         print(f"[warn] metadata failed ({e}), saved as {fallback.name}")
@@ -77,16 +119,20 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
                 pass
 
 
-def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem, suffix = path.stem, path.suffix
-    n = 2
-    while True:
-        candidate = path.with_name(f"{stem} ({n}){suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
+def _replace_path(path: Path) -> Path:
+    """Return path as-is, deleting any existing file (and companion .jpg) at that location."""
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    jpg = path.with_suffix(".jpg")
+    if jpg.exists():
+        try:
+            jpg.unlink()
+        except Exception:
+            pass
+    return path
 
 
 def _timestamp_name() -> str:

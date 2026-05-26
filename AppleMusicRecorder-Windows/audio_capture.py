@@ -13,13 +13,17 @@ from typing import Optional
 import numpy as np
 import pyaudiowpatch as pyaudio
 import soundfile as sf
+from typing import Callable, Optional
 
 
 CHUNK = 1024   # frames per read
+SILENCE_RMS_THRESHOLD = 30      # int16 RMS below this is considered silence (~-60 dBFS)
+SILENCE_DURATION_SEC  = 10.0    # seconds of sustained silence before firing callback
 
 
 class AudioCapture:
-    def __init__(self, save_directory: str):
+    def __init__(self, save_directory: str,
+                 on_silence: Optional[Callable[[], None]] = None):
         self.save_directory = Path(save_directory)
         self.save_directory.mkdir(parents=True, exist_ok=True)
 
@@ -29,6 +33,10 @@ class AudioCapture:
         self._sf_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+
+        self._on_silence   = on_silence
+        self._silent_frames: int  = 0
+        self._silence_fired: bool = False
 
         self._device_info = self._find_loopback_device()
         self._sample_rate = int(self._device_info["defaultSampleRate"])
@@ -95,6 +103,23 @@ class AudioCapture:
                         self._sf.write(samples)
                     except Exception:
                         pass
+
+            # Silence detection
+            if self._on_silence and samples.size > 0:
+                rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                if rms < SILENCE_RMS_THRESHOLD:
+                    self._silent_frames += frame_count
+                else:
+                    self._silent_frames = 0
+                    self._silence_fired = False
+                if (not self._silence_fired
+                        and self._silent_frames / self._sample_rate >= SILENCE_DURATION_SEC):
+                    self._silence_fired = True
+                    try:
+                        self._on_silence()
+                    except Exception:
+                        pass
+
             return (None, pyaudio.paContinue)
 
         self._stream = self._pa.open(
@@ -113,6 +138,8 @@ class AudioCapture:
     def stop(self) -> Optional[str]:
         """Stop recording and close the current file. Returns the closed file path."""
         self._running = False
+        self._silent_frames = 0
+        self._silence_fired = False
         if self._stream:
             try:
                 self._stream.stop_stream()
@@ -127,6 +154,8 @@ class AudioCapture:
         Atomically swap to a new temp file without stopping the stream.
         Returns (finished_path, new_path).
         """
+        self._silent_frames = 0
+        self._silence_fired = False
         new_path = self._new_temp_path()
         new_sf = sf.SoundFile(
             new_path, mode="w",
