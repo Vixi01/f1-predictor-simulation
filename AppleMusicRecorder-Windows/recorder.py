@@ -17,8 +17,10 @@ from typing import Optional
 import pystray
 from PIL import Image, ImageDraw
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+if sys.stdout:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import metadata_writer
 import quality_check
