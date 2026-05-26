@@ -386,21 +386,30 @@ def run_tray():
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
+def _acquire_single_instance() -> object:
+    """Create a named Windows mutex. Returns the handle if this is the only instance,
+    or exits the process if another instance is already running."""
+    import ctypes
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "AppleMusicRecorder_SingleInstance")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("[error] Another instance of Apple Music Recorder is already running.")
+        sys.exit(0)
+    return mutex  # keep reference alive for process lifetime
+
+
 def main():
     global _monitor, _db, _quality_report, _guard
+
+    _mutex = _acquire_single_instance()
 
     Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
     print(f"[init] Saving recordings to: {SAVE_DIR}")
 
     _db = RecordingDB(SAVE_DIR)
 
-    def _on_contamination(offenders: list[ContaminatingSession]):
-        names = ", ".join(f"{o.process_name} ({o.peak:.0%})" for o in offenders[:3])
-        msg   = f"Other audio detected during recording: {names}"
-        print(f"[guard] {msg}")
-        _notify(msg, "Recording contamination warning")
-
-    _guard = SessionGuard(on_contamination=_on_contamination)
+    # Session guard runs silently — VB-Cable isolates recording so warnings
+    # about other apps are not actionable.
+    _guard = SessionGuard(on_contamination=lambda offenders: None)
 
     # Audio quality check
     try:

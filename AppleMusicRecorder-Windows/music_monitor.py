@@ -98,9 +98,32 @@ class MusicMonitor:
 
         try:
             manager = await wmc.GlobalSystemMediaTransportControlsSessionManager.request_async()
-            session = manager.get_current_session()
         except Exception:
             return
+
+        # Find an Apple Music session specifically — ignore Chrome, Spotify, etc.
+        session = None
+        try:
+            for s in manager.get_sessions():
+                app_id = (s.source_app_user_model_id or "").lower()
+                if any(x in app_id for x in ("applemusic", "itunes", "music")):
+                    session = s
+                    break
+        except Exception:
+            pass
+
+        # Fallback: accept current session only if its app ID looks like Apple Music
+        if session is None:
+            try:
+                cur = manager.get_current_session()
+                if cur:
+                    app_id = (cur.source_app_user_model_id or "").lower()
+                    if any(x in app_id for x in ("applemusic", "itunes", "music")):
+                        session = cur
+                    else:
+                        print(f"[monitor] ignoring non-Apple-Music SMTC session: {app_id[:60]}")
+            except Exception:
+                pass
 
         if session is None:
             self._emit_status("stopped")

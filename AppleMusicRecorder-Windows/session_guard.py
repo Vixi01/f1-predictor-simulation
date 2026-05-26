@@ -8,7 +8,8 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-_APPLE_MUSIC_NAMES = {"applemusic.exe", "itunes.exe", "music.exe"}
+_APPLE_MUSIC_NAMES = {"applemusic.exe", "itunes.exe", "music.exe",
+                      "python.exe", "pythonw.exe", "amplibraryagent.exe"}
 _PEAK_THRESHOLD    = 0.01   # sessions louder than this are "active"
 _CHECK_INTERVAL    = 5.0    # seconds between periodic checks
 
