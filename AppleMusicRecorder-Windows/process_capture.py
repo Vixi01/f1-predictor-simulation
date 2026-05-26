@@ -1,15 +1,11 @@
 """
 process_capture.py
-Captures audio from a specific Windows process using
+Captures audio from Apple Music's process only via
 AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK (Windows 10 build 20348+).
 
-This bypasses the system-wide WASAPI loopback and taps only the target
-process's audio output — so background system sounds never bleed in.
-
-Falls back gracefully to system loopback (via pyaudiowpatch) if:
-  - Apple Music process is not found
-  - The process-loopback activation fails
-  - Windows build is too old
+All COM work (activation + capture loop) runs on a single MTA thread to
+satisfy ActivateAudioInterfaceAsync's apartment requirements.
+Falls back gracefully to system loopback if anything fails.
 """
 import ctypes
 import ctypes.wintypes
@@ -17,6 +13,7 @@ import struct
 import threading
 import time
 import uuid as _uuid_mod
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -26,32 +23,28 @@ import soundfile as sf
 
 # ── Windows constants ──────────────────────────────────────────────────────────
 
-AUDCLNT_SHAREMODE_SHARED              = 0
-AUDCLNT_STREAMFLAGS_LOOPBACK          = 0x00020000
-AUDCLNT_STREAMFLAGS_EVENTCALLBACK     = 0x00040000
-AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM    = 0x80000000
+AUDCLNT_SHAREMODE_SHARED                = 0
+AUDCLNT_STREAMFLAGS_LOOPBACK            = 0x00020000
+AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM     = 0x80000000
 AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000
+COINIT_MULTITHREADED                    = 0x0
 
-AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1
-PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0
+AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK          = 1
+PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE     = 0
 
 VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK = "VAD\\Process_Loopback"
+VT_BLOB = 0x41
 
-VT_BLOB = 0x41  # PROPVARIANT blob type
-
-CHUNK_FRAMES = 1024
-_APPLE_MUSIC_NAMES = {"AppleMusic.exe", "iTunes.exe", "music.exe"}
+_APPLE_MUSIC_NAMES = {"AppleMusic.exe", "iTunes.exe", "Music.exe"}
 
 
 # ── GUIDs ──────────────────────────────────────────────────────────────────────
 
-def _guid_bytes(s: str) -> bytes:
+def _gb(s: str) -> bytes:
     return _uuid_mod.UUID(s).bytes_le
 
-
-IID_IAudioClient = _guid_bytes("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
-IID_IAudioCaptureClient = _guid_bytes("{C8ADBD64-E71E-48a0-A4DE-185C395CD317}")
-IID_IActivateAudioInterfaceCompletionHandler = _guid_bytes("{41D949AB-9862-444A-80F6-C261334DA5EB}")
+IID_IAudioClient        = _gb("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
+IID_IAudioCaptureClient = _gb("{C8ADBD64-E71E-48a0-A4DE-185C395CD317}")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -66,43 +59,26 @@ def find_apple_music_pid() -> Optional[int]:
     return None
 
 
-def _make_waveformatex(sample_rate: int, channels: int, bits: int = 32) -> bytes:
-    """Build a WAVEFORMATEXTENSIBLE struct for float32 PCM."""
-    block_align = channels * (bits // 8)
-    avg_bytes   = sample_rate * block_align
-    # WAVEFORMATEX: fmt_tag(2) channels(2) sample_rate(4) avg_bytes(4)
-    #               block_align(2) bits(2) cb_size(2)
-    wfx = struct.pack("<HHIIHH", 3, channels, sample_rate, avg_bytes, block_align, bits)
-    # cbSize = 22 for WAVEFORMATEXTENSIBLE
-    wfx += struct.pack("<H", 22)
-    # WAVEFORMATEXTENSIBLE extras: valid_bits(2) channel_mask(4) sub_format(16)
-    # Sub-format KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-    ksdataformat_float = _guid_bytes("{00000003-0000-0010-8000-00aa00389b71}")
-    wfx += struct.pack("<HI", bits, 0) + ksdataformat_float
-    return wfx
-
-
-# ── COM completion handler (implements IActivateAudioInterfaceCompletionHandler) ─
+# ── Completion handler COM object ──────────────────────────────────────────────
 
 class _CompletionHandler:
     """
-    Minimal COM object satisfying IActivateAudioInterfaceCompletionHandler.
-    Windows calls ActivateCompleted on a thread-pool thread; we signal an
-    Event so the caller can wait synchronously.
+    Implements IActivateAudioInterfaceCompletionHandler as a raw COM vtable
+    object. Windows calls ActivateCompleted on a thread-pool thread.
     """
     def __init__(self):
         self.done     = threading.Event()
         self.hr       = -1
-        self.audio_client_ptr = None
+        self.ac_ptr   = None  # raw c_void_p value of IAudioClient
 
-        # Build vtable: QI, AddRef, Release, ActivateCompleted
         WINFUNC = ctypes.WINFUNCTYPE
 
         @WINFUNC(ctypes.HRESULT, ctypes.c_void_p,
-                 ctypes.POINTER(ctypes.c_byte * 16), ctypes.POINTER(ctypes.c_void_p))
+                 ctypes.POINTER(ctypes.c_byte * 16),
+                 ctypes.POINTER(ctypes.c_void_p))
         def _qi(this, riid, ppv):
             ppv[0] = ctypes.cast(self._obj_ptr, ctypes.c_void_p).value
-            return 0
+            return 0  # S_OK
 
         @WINFUNC(ctypes.c_ulong, ctypes.c_void_p)
         def _addref(this): return 1
@@ -118,85 +94,129 @@ class _CompletionHandler:
                 vtbl     = ctypes.cast(op_iface[0], ctypes.POINTER(ctypes.c_void_p))
                 GetActivateResult = ctypes.WINFUNCTYPE(
                     ctypes.HRESULT, ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.HRESULT), ctypes.POINTER(ctypes.c_void_p)
+                    ctypes.POINTER(ctypes.HRESULT),
+                    ctypes.POINTER(ctypes.c_void_p),
                 )(vtbl[3])
                 inner_hr = ctypes.HRESULT()
-                ac_ptr   = ctypes.c_void_p()
-                GetActivateResult(operation, ctypes.byref(inner_hr), ctypes.byref(ac_ptr))
-                self.hr = inner_hr.value
-                self.audio_client_ptr = ac_ptr.value
-            except Exception as e:
+                ac       = ctypes.c_void_p()
+                GetActivateResult(operation,
+                                  ctypes.byref(inner_hr),
+                                  ctypes.byref(ac))
+                self.hr     = inner_hr.value
+                self.ac_ptr = ac.value
+            except Exception:
                 self.hr = -1
             finally:
                 self.done.set()
             return 0
 
-        # Keep references alive
-        self._qi = _qi
-        self._addref = _addref
-        self._release = _release
-        self._activate_completed = _activate_completed
+        # Keep all function objects alive
+        self._qi = _qi; self._addref = _addref
+        self._release = _release; self._activate_completed = _activate_completed
 
-        _VtableArr = ctypes.c_void_p * 4
-        self._vtable = _VtableArr(
-            ctypes.cast(_qi, ctypes.c_void_p),
-            ctypes.cast(_addref, ctypes.c_void_p),
-            ctypes.cast(_release, ctypes.c_void_p),
-            ctypes.cast(_activate_completed, ctypes.c_void_p),
+        _Vtbl = ctypes.c_void_p * 4
+        self._vtable = _Vtbl(
+            ctypes.cast(_qi,                  ctypes.c_void_p),
+            ctypes.cast(_addref,              ctypes.c_void_p),
+            ctypes.cast(_release,             ctypes.c_void_p),
+            ctypes.cast(_activate_completed,  ctypes.c_void_p),
         )
-        _ObjArr = ctypes.c_void_p * 1
-        self._obj = _ObjArr(ctypes.addressof(self._vtable))
+        _Obj = ctypes.c_void_p * 1
+        self._obj     = _Obj(ctypes.addressof(self._vtable))
         self._obj_ptr = ctypes.addressof(self._obj)
 
-    def as_ptr(self) -> ctypes.c_void_p:
+    def handler_ptr(self) -> ctypes.c_void_p:
         return ctypes.c_void_p(self._obj_ptr)
+
+
+# ── IAudioClient vtable helpers ────────────────────────────────────────────────
+# Vtable layout (0-based):
+# [0]QI [1]AddRef [2]Release [3]Initialize [4]GetBufferSize [5]GetStreamLatency
+# [6]GetCurrentPadding [7]IsFormatSupported [8]GetMixFormat [9]GetDevicePeriod
+# [10]Start [11]Stop [12]Reset [13]SetEventHandle [14]GetService
+
+def _vtbl(ptr):
+    iface = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))
+    return ctypes.cast(iface[0], ctypes.POINTER(ctypes.c_void_p))
+
+
+def _ac_get_mix_format(ac_ptr) -> Optional[bytes]:
+    """Call IAudioClient::GetMixFormat, return raw WAVEFORMATEX bytes."""
+    try:
+        vt = _vtbl(ac_ptr)
+        GetMixFormat = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+        )(vt[8])
+        fmt_ptr = ctypes.c_void_p()
+        hr = GetMixFormat(ac_ptr, ctypes.byref(fmt_ptr))
+        if hr != 0 or not fmt_ptr.value:
+            return None
+        raw = bytes((ctypes.c_byte * 40).from_address(fmt_ptr.value))
+        ctypes.windll.ole32.CoTaskMemFree(fmt_ptr)
+        return raw
+    except Exception:
+        return None
+
+
+def _parse_waveformat(raw: bytes):
+    """Parse WAVEFORMATEX/WAVEFORMATEXTENSIBLE; return (rate, channels, bits)."""
+    if len(raw) < 18:
+        return 48000, 2, 32
+    _fmt_tag, channels, rate, _, _, bits, _ = struct.unpack_from("<HHIIHH H", raw)
+    return rate, channels, bits
 
 
 # ── ProcessAudioCapture ────────────────────────────────────────────────────────
 
 class ProcessAudioCapture:
     """
-    Captures audio from Apple Music's process only.
-    API mirrors AudioCapture: start() -> temp_path, stop() -> temp_path,
-    split() -> (finished_path, new_path).
+    Captures Apple Music process audio only.
+    API-compatible with AudioCapture: start() → temp_path,
+    stop() → temp_path, split() → (finished, new).
     """
 
-    def __init__(self, save_directory: str, pid: int,
-                 sample_rate: int = 48000, channels: int = 2):
-        from pathlib import Path
+    def __init__(self, save_directory: str, pid: int):
         self.save_directory = Path(save_directory)
         self.save_directory.mkdir(parents=True, exist_ok=True)
-        self._pid           = pid
-        self._sample_rate   = sample_rate
-        self._channels      = channels
-        self._running       = False
+        self._pid       = pid
+        self._running   = False
         self._sf: Optional[sf.SoundFile] = None
-        self._sf_lock       = threading.Lock()
+        self._sf_lock   = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self.current_temp_path: Optional[str] = None
 
-        self._audio_client   = None  # raw c_void_p value
-        self._capture_client = None
+        self._sample_rate = 48000
+        self._channels    = 2
+        self._bits        = 32
 
-    # ── Public ─────────────────────────────────────────────────────────────────
+        self._init_error: Optional[Exception] = None
+        self._ready      = threading.Event()
+
+    # ── Public API ─────────────────────────────────────────────────────────────
 
     def start(self) -> str:
         temp_path = self._new_temp_path()
-        self._open_sf(temp_path)
-        self._audio_client, self._capture_client = self._activate_and_init()
-        self._running = True
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True,
-                                        name="ProcessCapture")
-        self._thread.start()
+        # SoundFile will be opened once format is known (inside MTA thread)
         self.current_temp_path = temp_path
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._mta_main, args=(temp_path,),
+            daemon=True, name="ProcessCaptureMTA",
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=10):
+            self._running = False
+            raise RuntimeError("Process audio activation timed out")
+        if self._init_error:
+            self._running = False
+            raise self._init_error
         return temp_path
 
     def stop(self) -> Optional[str]:
         self._running = False
         if self._thread:
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=4)
             self._thread = None
-        self._stop_audio_client()
         return self._close_sf()
 
     def split(self) -> tuple[str, str]:
@@ -208,7 +228,7 @@ class ProcessAudioCapture:
             format="FLAC", subtype="PCM_24",
         )
         with self._sf_lock:
-            old_sf = self._sf
+            old_sf   = self._sf
             self._sf = new_sf
             old_path = self.current_temp_path
             self.current_temp_path = new_path
@@ -216,75 +236,123 @@ class ProcessAudioCapture:
             old_sf.close()
         return old_path, new_path
 
-    # ── COM / WASAPI activation ────────────────────────────────────────────────
+    # ── MTA thread — activation + capture ─────────────────────────────────────
 
-    def _activate_and_init(self):
-        """
-        Call ActivateAudioInterfaceAsync with process loopback params,
-        then initialize the IAudioClient and get IAudioCaptureClient.
-        Returns (audio_client_ptr, capture_client_ptr).
-        """
+    def _mta_main(self, temp_path: str):
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
+        try:
+            ac_ptr, cc_ptr = self._activate_and_start()
+        except Exception as e:
+            self._init_error = e
+            self._ready.set()
+            ole32.CoUninitialize()
+            return
+
+        # Open the SoundFile now that we know the real format
+        try:
+            with self._sf_lock:
+                self._sf = sf.SoundFile(
+                    temp_path, mode="w",
+                    samplerate=self._sample_rate,
+                    channels=self._channels,
+                    format="FLAC", subtype="PCM_24",
+                )
+        except Exception as e:
+            self._init_error = e
+            self._ready.set()
+            ole32.CoUninitialize()
+            return
+
+        self._ready.set()
+        self._capture_loop(cc_ptr)
+
+        # Stop IAudioClient
+        try:
+            vt   = _vtbl(ac_ptr)
+            Stop = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vt[11])
+            Stop(ac_ptr)
+        except Exception:
+            pass
+
+        ole32.CoUninitialize()
+
+    # ── Activation ─────────────────────────────────────────────────────────────
+
+    def _activate_and_start(self):
         mmdevapi = ctypes.windll.mmdevapi
 
-        # Build AUDIOCLIENT_ACTIVATION_PARAMS (12 bytes)
-        # ActivationType(4) + TargetProcessId(4) + ProcessLoopbackMode(4)
-        params_bytes = struct.pack("<III",
+        # ── Build AUDIOCLIENT_ACTIVATION_PARAMS (12 bytes) ──────────────────
+        params_bytes = struct.pack(
+            "<III",
             AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             self._pid,
             PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
         )
         params_buf = (ctypes.c_byte * len(params_bytes))(*params_bytes)
+        blob_ptr   = ctypes.cast(params_buf, ctypes.c_void_p)
 
-        # Build PROPVARIANT { vt=VT_BLOB, blob={cbSize, pBlobData} }
-        # PROPVARIANT layout (at minimum): vt(2) pad(6) blob_size(4) blob_ptr(8)
-        blob_ptr = ctypes.cast(params_buf, ctypes.c_void_p)
-        propvar  = (ctypes.c_byte * 32)()
-        struct.pack_into("<H", propvar, 0, VT_BLOB)       # vt
-        struct.pack_into("<I", propvar, 8, len(params_bytes))  # cbSize
-        struct.pack_into("<Q", propvar, 12, blob_ptr.value)    # pBlobData
+        # ── Build PROPVARIANT (24 bytes on 64-bit) ───────────────────────────
+        # offset  0: VARTYPE vt (2)
+        # offset  2-7: reserved padding (6)
+        # offset  8: BLOB.cbSize (4)
+        # offset 12-15: padding for 8-byte pointer alignment (4)
+        # offset 16: BLOB.pBlobData (8)
+        propvar = (ctypes.c_byte * 24)()
+        struct.pack_into("<H", propvar, 0,  VT_BLOB)
+        struct.pack_into("<I", propvar, 8,  len(params_bytes))
+        struct.pack_into("<Q", propvar, 16, blob_ptr.value)
 
-        handler   = _CompletionHandler()
-        iid_ac    = (ctypes.c_byte * 16)(*IID_IAudioClient)
-        device_path = VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+        handler  = _CompletionHandler()
+        iid_ac   = (ctypes.c_byte * 16)(*IID_IAudioClient)
+        async_op = ctypes.c_void_p()
 
-        async_op  = ctypes.c_void_p()
         hr = mmdevapi.ActivateAudioInterfaceAsync(
-            device_path,
+            ctypes.c_wchar_p(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK),
             ctypes.byref(iid_ac),
             ctypes.byref(propvar),
-            handler.as_ptr(),
+            handler.handler_ptr(),
             ctypes.byref(async_op),
         )
         if hr != 0:
-            raise RuntimeError(f"ActivateAudioInterfaceAsync failed: 0x{hr & 0xFFFFFFFF:08X}")
+            raise RuntimeError(
+                f"ActivateAudioInterfaceAsync failed: 0x{hr & 0xFFFFFFFF:08X}"
+            )
 
-        if not handler.done.wait(timeout=5.0):
-            raise RuntimeError("Process loopback activation timed out")
-
+        if not handler.done.wait(timeout=8.0):
+            raise RuntimeError("Activation completion handler timed out")
         if handler.hr != 0:
-            raise RuntimeError(f"Activation completed with error: 0x{handler.hr & 0xFFFFFFFF:08X}")
+            raise RuntimeError(
+                f"Activation error: 0x{handler.hr & 0xFFFFFFFF:08X}"
+            )
+        if not handler.ac_ptr:
+            raise RuntimeError("Activation returned null audio client")
 
-        ac_ptr = handler.audio_client_ptr
+        ac_ptr = handler.ac_ptr
 
-        # IAudioClient::Initialize
-        wfx = _make_waveformatex(self._sample_rate, self._channels)
-        wfx_buf = (ctypes.c_byte * len(wfx))(*wfx)
+        # ── GetMixFormat to detect real sample rate / channels ───────────────
+        fmt_raw = _ac_get_mix_format(ac_ptr)
+        if fmt_raw:
+            self._sample_rate, self._channels, self._bits = _parse_waveformat(fmt_raw)
+            fmt_ptr_val = ctypes.cast(
+                (ctypes.c_byte * len(fmt_raw))(*fmt_raw), ctypes.c_void_p
+            )
 
-        ac_iface = ctypes.cast(ac_ptr, ctypes.POINTER(ctypes.c_void_p))
-        vtbl     = ctypes.cast(ac_iface[0], ctypes.POINTER(ctypes.c_void_p))
-
-        # IAudioClient vtable: [0]QI [1]AddRef [2]Release [3]Initialize
+        # ── Initialize ───────────────────────────────────────────────────────
+        vt = _vtbl(ac_ptr)
         Initialize = ctypes.WINFUNCTYPE(
             ctypes.HRESULT, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_uint,
             ctypes.c_longlong, ctypes.c_longlong,
             ctypes.c_void_p, ctypes.c_void_p,
-        )(vtbl[3])
+        )(vt[3])
 
+        wfx_buf = (ctypes.c_byte * len(fmt_raw))(*fmt_raw) if fmt_raw else (ctypes.c_byte * 0)()
         hr = Initialize(
             ac_ptr,
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+            AUDCLNT_STREAMFLAGS_LOOPBACK |
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
             AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
             0, 0,
             ctypes.cast(wfx_buf, ctypes.c_void_p),
@@ -293,120 +361,97 @@ class ProcessAudioCapture:
         if hr != 0:
             raise RuntimeError(f"IAudioClient::Initialize failed: 0x{hr & 0xFFFFFFFF:08X}")
 
-        # IAudioClient::GetService(IID_IAudioCaptureClient)
-        # vtable[9] = GetService
-        iid_cc  = (ctypes.c_byte * 16)(*IID_IAudioCaptureClient)
-        cc_ptr  = ctypes.c_void_p()
+        # ── GetService(IAudioCaptureClient) — vtable index 14 ────────────────
+        iid_cc = (ctypes.c_byte * 16)(*IID_IAudioCaptureClient)
+        cc_ptr = ctypes.c_void_p()
         GetService = ctypes.WINFUNCTYPE(
             ctypes.HRESULT, ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_byte * 16), ctypes.POINTER(ctypes.c_void_p)
-        )(vtbl[9])
+            ctypes.POINTER(ctypes.c_byte * 16),
+            ctypes.POINTER(ctypes.c_void_p),
+        )(vt[14])
         hr = GetService(ac_ptr, ctypes.byref(iid_cc), ctypes.byref(cc_ptr))
         if hr != 0:
-            raise RuntimeError(f"GetService(IAudioCaptureClient) failed: 0x{hr & 0xFFFFFFFF:08X}")
+            raise RuntimeError(
+                f"GetService(IAudioCaptureClient) failed: 0x{hr & 0xFFFFFFFF:08X}"
+            )
 
-        # IAudioClient::Start  (vtable[10])
-        Start = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vtbl[10])
+        # ── Start — vtable index 10 ───────────────────────────────────────────
+        Start = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vt[10])
         Start(ac_ptr)
 
         return ac_ptr, cc_ptr.value
 
     # ── Capture loop ───────────────────────────────────────────────────────────
 
-    def _capture_loop(self):
-        """
-        Reads from IAudioCaptureClient in a tight loop and writes to the
-        current SoundFile. Runs in its own daemon thread.
-        """
-        if not self._capture_client:
-            return
+    def _capture_loop(self, cc_ptr_val: int):
+        cc_iface = ctypes.cast(cc_ptr_val, ctypes.POINTER(ctypes.c_void_p))
+        vt       = ctypes.cast(cc_iface[0], ctypes.POINTER(ctypes.c_void_p))
 
-        cc_ptr   = self._capture_client
-        cc_iface = ctypes.cast(cc_ptr, ctypes.POINTER(ctypes.c_void_p))
-        vtbl     = ctypes.cast(cc_iface[0], ctypes.POINTER(ctypes.c_void_p))
-
-        # IAudioCaptureClient vtable:
-        # [0]QI [1]AddRef [2]Release [3]GetBuffer [4]ReleaseBuffer [5]GetNextPacketSize
+        # IAudioCaptureClient: [3]GetBuffer [4]ReleaseBuffer [5]GetNextPacketSize
         GetBuffer = ctypes.WINFUNCTYPE(
             ctypes.HRESULT, ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),   # ppData
-            ctypes.POINTER(ctypes.c_uint),      # pNumFramesAvailable
-            ctypes.POINTER(ctypes.c_uint),      # pdwFlags
-            ctypes.POINTER(ctypes.c_ulonglong), # pu64DevicePosition
-            ctypes.POINTER(ctypes.c_ulonglong), # pu64QPCPosition
-        )(vtbl[3])
-
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_ulonglong),
+            ctypes.POINTER(ctypes.c_ulonglong),
+        )(vt[3])
         ReleaseBuffer = ctypes.WINFUNCTYPE(
             ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint
-        )(vtbl[4])
-
+        )(vt[4])
         GetNextPacketSize = ctypes.WINFUNCTYPE(
             ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)
-        )(vtbl[5])
+        )(vt[5])
 
-        bytes_per_frame = self._channels * 4  # float32
+        bytes_per_frame = self._channels * (self._bits // 8)
 
         while self._running:
-            packet_size = ctypes.c_uint(0)
-            hr = GetNextPacketSize(cc_ptr, ctypes.byref(packet_size))
-            if hr != 0 or packet_size.value == 0:
+            pkt = ctypes.c_uint(0)
+            if GetNextPacketSize(cc_ptr_val, ctypes.byref(pkt)) != 0 or pkt.value == 0:
                 time.sleep(0.005)
                 continue
 
-            data_ptr  = ctypes.c_void_p()
-            n_frames  = ctypes.c_uint(0)
-            flags     = ctypes.c_uint(0)
-            dev_pos   = ctypes.c_ulonglong(0)
-            qpc_pos   = ctypes.c_ulonglong(0)
-
-            hr = GetBuffer(cc_ptr,
-                           ctypes.byref(data_ptr), ctypes.byref(n_frames),
-                           ctypes.byref(flags), ctypes.byref(dev_pos), ctypes.byref(qpc_pos))
-            if hr != 0 or not data_ptr.value:
+            data  = ctypes.c_void_p()
+            n     = ctypes.c_uint(0)
+            flags = ctypes.c_uint(0)
+            dp    = ctypes.c_ulonglong(0)
+            qp    = ctypes.c_ulonglong(0)
+            hr = GetBuffer(cc_ptr_val, ctypes.byref(data), ctypes.byref(n),
+                           ctypes.byref(flags), ctypes.byref(dp), ctypes.byref(qp))
+            if hr != 0 or not data.value:
                 time.sleep(0.005)
                 continue
 
-            n = n_frames.value
-            raw = (ctypes.c_byte * (n * bytes_per_frame)).from_address(data_ptr.value)
-            samples = np.frombuffer(bytes(raw), dtype=np.float32).reshape(-1, self._channels)
+            frame_count = n.value
+            raw = bytes((ctypes.c_byte * (frame_count * bytes_per_frame))
+                        .from_address(data.value))
+
+            # Convert to float32 for writing; then quantise to int32 for PCM_24
+            if self._bits == 32:
+                samples_f = np.frombuffer(raw, dtype=np.float32)
+            elif self._bits == 16:
+                samples_f = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            else:
+                samples_f = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+
+            samples_f = samples_f.reshape(-1, self._channels)
+            # Quantise to int32 range for PCM_24 FLAC (soundfile expects int32 values)
+            samples_i = (samples_f * 8388607.0).clip(-8388608, 8388607).astype(np.int32)
 
             with self._sf_lock:
                 if self._sf:
                     try:
-                        self._sf.write(samples)
+                        self._sf.write(samples_i)
                     except Exception:
                         pass
 
-            ReleaseBuffer(cc_ptr, n)
-
-    # ── Audio client stop ──────────────────────────────────────────────────────
-
-    def _stop_audio_client(self):
-        if self._audio_client:
-            try:
-                ac_iface = ctypes.cast(self._audio_client, ctypes.POINTER(ctypes.c_void_p))
-                vtbl     = ctypes.cast(ac_iface[0], ctypes.POINTER(ctypes.c_void_p))
-                Stop = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vtbl[11])
-                Stop(self._audio_client)
-            except Exception:
-                pass
-            self._audio_client = None
+            ReleaseBuffer(cc_ptr_val, frame_count)
 
     # ── File helpers ───────────────────────────────────────────────────────────
 
     def _new_temp_path(self) -> str:
         import uuid
-        from pathlib import Path
-        name = f".amr_tmp_{uuid.uuid4().hex}.flac"
-        return str(self.save_directory / name)
-
-    def _open_sf(self, path: str):
-        self._sf = sf.SoundFile(
-            path, mode="w",
-            samplerate=self._sample_rate,
-            channels=self._channels,
-            format="FLAC", subtype="PCM_24",
-        )
+        return str(self.save_directory / f".amr_tmp_{uuid.uuid4().hex}.flac")
 
     def _close_sf(self) -> Optional[str]:
         with self._sf_lock:

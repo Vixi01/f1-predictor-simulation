@@ -76,18 +76,28 @@ def _start_recording(track: TrackInfo):
     with _lock:
         if _recording:
             return
+
+        cap = _make_capture(SAVE_DIR)
+        temp = None
         try:
-            _capture = _make_capture(SAVE_DIR)
-            temp = _capture.start()
-            _recording = True
-            _recording_interrupted = False
-            if _db:
-                _db.mark_recording(track.artist, track.album, track.title,
-                                   track.duration_sec, temp)
-            print(f"[recording] started -> {Path(temp).name}")
+            temp = cap.start()
         except Exception as e:
-            print(f"[error] Could not start recording: {e}")
-            _capture = None
+            print(f"[capture] Primary capture failed ({e}), falling back to system loopback")
+            try:
+                cap  = AudioCapture(SAVE_DIR)
+                temp = cap.start()
+                print("[capture] Using system-wide WASAPI loopback (fallback)")
+            except Exception as e2:
+                print(f"[error] Could not start recording: {e2}")
+                return
+
+        _capture = cap
+        _recording = True
+        _recording_interrupted = False
+        if _db:
+            _db.mark_recording(track.artist, track.album, track.title,
+                               track.duration_sec, temp)
+        print(f"[recording] started -> {Path(temp).name}")
 
 
 def _stop_recording(reason: str = "natural end") -> Optional[tuple]:

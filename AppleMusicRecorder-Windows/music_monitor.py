@@ -39,10 +39,13 @@ class TrackInfo:
         return raw[:200]
 
 
-# Tolerance for seek detection: if position jumps more than this vs expected,
-# we treat it as a user seek.
-_SEEK_THRESHOLD_SEC = 4.0
+# Seek detection: if the position jumps more than this vs what we'd expect
+# from consecutive polls, it's a user seek (not a track start).
+_SEEK_THRESHOLD_SEC = 6.0
 _POLL_INTERVAL = 0.3
+
+# Titles that indicate Apple Music is loading, not actually playing a song.
+_IGNORE_TITLES = {"Connecting…", "Connecting...", "Loading…", "Loading..."}
 
 
 class MusicMonitor:
@@ -56,9 +59,11 @@ class MusicMonitor:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-        # Seek detection state
-        self._playback_start_wall: Optional[float] = None   # wall time when play began
-        self._playback_start_pos: float = 0.0               # SMTC position when play began
+        # Seek detection: compare position between consecutive polls.
+        # A genuine seek = position jumps more than expected given elapsed wall time.
+        self._prev_pos_sec:  float = 0.0
+        self._prev_pos_wall: float = 0.0
+        self._seek_tracking_active: bool = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -151,12 +156,8 @@ class MusicMonitor:
         except Exception:
             pass
 
-        # ── Seek detection ────────────────────────────────────────────────────
-        if is_playing:
-            self._check_seek(position_sec)
-
         # ── Track change ──────────────────────────────────────────────────────
-        if not title:
+        if not title or title in _IGNORE_TITLES:
             self._emit_track(None)
             return
 
@@ -164,30 +165,38 @@ class MusicMonitor:
                               duration_sec=duration_sec)
 
         if candidate != self._current:
+            # New song: reset seek tracking BEFORE emitting to prevent false seeks
+            self._seek_tracking_active = False
             artwork = self._fetch_artwork(artist, album, title)
             candidate.artwork_data = artwork
             self._emit_track(candidate)
-            # Reset seek tracking for new song
             if is_playing:
-                self._playback_start_wall = time.monotonic()
-                self._playback_start_pos  = position_sec
+                self._prev_pos_sec  = position_sec
+                self._prev_pos_wall = time.monotonic()
+                self._seek_tracking_active = True
+        elif is_playing:
+            # Same song — check for position jump between consecutive polls
+            self._check_seek(position_sec)
 
     # ── Seek detection ────────────────────────────────────────────────────────
 
     def _check_seek(self, position_sec: float):
-        if self._playback_start_wall is None:
-            self._playback_start_wall = time.monotonic()
-            self._playback_start_pos  = position_sec
+        if not self._seek_tracking_active:
+            self._prev_pos_sec  = position_sec
+            self._prev_pos_wall = time.monotonic()
+            self._seek_tracking_active = True
             return
 
-        elapsed_wall = time.monotonic() - self._playback_start_wall
-        expected_pos = self._playback_start_pos + elapsed_wall
-        delta = abs(position_sec - expected_pos)
+        now          = time.monotonic()
+        elapsed_wall = now - self._prev_pos_wall
+        expected_pos = self._prev_pos_sec + elapsed_wall
+        delta        = abs(position_sec - expected_pos)
 
-        if delta > _SEEK_THRESHOLD_SEC:
-            # Seek detected — reset tracking from new position
-            self._playback_start_wall = time.monotonic()
-            self._playback_start_pos  = position_sec
+        # Always update tracking
+        self._prev_pos_sec  = position_sec
+        self._prev_pos_wall = now
+
+        if delta > _SEEK_THRESHOLD_SEC and elapsed_wall > 0.1:
             if self.on_seek_detected:
                 try:
                     self.on_seek_detected(position_sec)
@@ -200,11 +209,7 @@ class MusicMonitor:
         if status != self._last_status:
             self._last_status = status
             if status == "stopped":
-                # Reset seek tracking
-                self._playback_start_wall = None
-            elif status == "playing" and self._playback_start_wall is None:
-                self._playback_start_wall = time.monotonic()
-                self._playback_start_pos  = 0.0
+                self._seek_tracking_active = False
             if self.on_playback_status:
                 try:
                     self.on_playback_status(status)
