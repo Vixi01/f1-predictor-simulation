@@ -25,6 +25,7 @@ import quality_check
 from audio_capture import AudioCapture
 from music_monitor import MusicMonitor, TrackInfo
 from recording_db import RecordingDB, Status
+from session_guard import SessionGuard, ContaminatingSession
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -50,6 +51,7 @@ _recording      = False
 _current_track: Optional[TrackInfo] = None
 _recording_interrupted = False   # set on pause or seek
 _quality_report = None
+_guard: Optional[SessionGuard] = None
 
 
 # ── Capture factory (tries process loopback, falls back to system loopback) ────
@@ -98,6 +100,9 @@ def _start_recording(track: TrackInfo):
             _db.mark_recording(track.artist, track.album, track.title,
                                track.duration_sec, temp)
         print(f"[recording] started -> {Path(temp).name}")
+        if _guard:
+            _guard.check_now()
+            _guard.start()
 
 
 def _stop_recording(reason: str = "natural end") -> Optional[tuple]:
@@ -111,6 +116,8 @@ def _stop_recording(reason: str = "natural end") -> Optional[tuple]:
         was_interrupted = _recording_interrupted
         _recording = False
         print(f"[recording] stopped ({reason})")
+    if _guard:
+        _guard.stop()
     return temp, track, was_interrupted
 
 
@@ -137,6 +144,8 @@ def _discard_recording(reason: str):
         temp = _capture.stop()
         _recording = False
         _recording_interrupted = True
+    if _guard:
+        _guard.stop()
     if temp:
         try:
             os.remove(temp)
@@ -378,12 +387,20 @@ def run_tray():
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
 def main():
-    global _monitor, _db, _quality_report
+    global _monitor, _db, _quality_report, _guard
 
     Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
     print(f"[init] Saving recordings to: {SAVE_DIR}")
 
     _db = RecordingDB(SAVE_DIR)
+
+    def _on_contamination(offenders: list[ContaminatingSession]):
+        names = ", ".join(f"{o.process_name} ({o.peak:.0%})" for o in offenders[:3])
+        msg   = f"Other audio detected during recording: {names}"
+        print(f"[guard] {msg}")
+        _notify(msg, "Recording contamination warning")
+
+    _guard = SessionGuard(on_contamination=_on_contamination)
 
     # Audio quality check
     try:
