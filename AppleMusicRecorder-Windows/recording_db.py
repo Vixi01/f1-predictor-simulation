@@ -42,7 +42,8 @@ class RecordingDB:
     def should_record(self, artist: str, album: str, title: str) -> tuple[bool, str]:
         """
         Returns (True, reason) if we should record, (False, reason) if not.
-        We skip only VERIFIED records. INCOMPLETE ones get re-recorded.
+        We skip only VERIFIED records whose file still exists on disk.
+        INCOMPLETE ones always get re-recorded.
         """
         key = self._key(artist, album, title)
         with self._lock:
@@ -50,7 +51,11 @@ class RecordingDB:
         if rec is None:
             return True, "no existing recording"
         if rec["status"] == Status.VERIFIED:
-            return False, f"already verified ({rec['path']})"
+            file_path = rec.get("path", "")
+            if file_path and Path(file_path).exists():
+                return False, f"already verified ({file_path})"
+            # File was deleted — reset to allow re-recording
+            return True, "verified file was deleted, re-recording"
         if rec["status"] == Status.INCOMPLETE:
             return True, f"previous recording was incomplete: {rec.get('reason', '')}"
         return True, "re-recording"
