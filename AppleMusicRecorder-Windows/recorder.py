@@ -344,7 +344,7 @@ def _notify(message: str, title: str = "Apple Music Recorder"):
 def _cleanup_incomplete_files(save_dir: str):
     """Delete any leftover *_incomplete_*.flac files from previous sessions."""
     folder = Path(save_dir)
-    stale = list(folder.glob("*_incomplete_*.flac"))
+    stale = list(folder.rglob("*_incomplete_*.flac"))
     for f in stale:
         try:
             f.unlink()
@@ -356,7 +356,7 @@ def _cleanup_incomplete_files(save_dir: str):
 def _retry_untagged(save_dir: str):
     """On startup, find *_untagged.flac files and attempt to re-tag them."""
     folder = Path(save_dir)
-    untagged = list(folder.glob("*_untagged.flac"))
+    untagged = list(folder.rglob("*_untagged.flac"))
     if not untagged:
         return
     print(f"[startup] Found {len(untagged)} untagged file(s), retrying...")
@@ -379,7 +379,8 @@ def _export_playlist(save_dir: str) -> Optional[Path]:
     from mutagen.flac import FLAC as _FLAC
     import soundfile as _sf
     folder = Path(save_dir)
-    flacs  = sorted(folder.glob("*.flac"))
+    flacs  = sorted(f for f in folder.rglob("*.flac")
+                    if "Artwork" not in f.parts and "_untagged" not in f.name)
     if not flacs:
         return None
     playlist_path = folder / "Apple Music Recordings.m3u"

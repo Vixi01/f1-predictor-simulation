@@ -45,7 +45,14 @@ def retag_untagged_file(untagged_path: Path, save_dir: Path, db=None) -> Optiona
         audio["artist"] = [artist]
         audio["album"]  = [album]
 
-        art_path = save_dir / f"{stem}.jpg"
+        safe = lambda s: "".join(c for c in s if c not in r':*?"<>|/\\').strip()
+        track_dir = save_dir / safe(artist) / safe(album)
+        track_dir.mkdir(parents=True, exist_ok=True)
+        final_path = _replace_path(track_dir / f"{safe(title)}.flac")
+
+        art_dir  = save_dir / "Artwork"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        art_path = art_dir / f"{stem}.jpg"
         artwork_data: Optional[bytes] = None
 
         if not art_path.exists():
@@ -60,8 +67,6 @@ def retag_untagged_file(untagged_path: Path, save_dir: Path, db=None) -> Optiona
             art_path.write_bytes(artwork_data)
 
         audio.save()
-
-        final_path = _replace_path(save_dir / f"{stem}.flac")
         os.replace(str(untagged_path), str(final_path))
         return final_path
 
@@ -74,10 +79,21 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
     if not os.path.exists(temp_path):
         return
 
-    save_dir   = Path(save_directory)
-    base_name  = track.safe_filename if track else _timestamp_name()
-    final_path = _replace_path(save_dir / f"{base_name}.flac")
-    art_path   = save_dir / f"{base_name}.jpg"
+    save_dir = Path(save_directory)
+
+    if track:
+        safe = lambda s: "".join(c for c in s if c not in r':*?"<>|/\\').strip()
+        track_dir  = save_dir / safe(track.artist) / safe(track.album)
+        track_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = safe(track.title)
+        final_path = _replace_path(track_dir / f"{safe_title}.flac")
+        art_dir    = save_dir / "Artwork"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        art_path   = art_dir / f"{track.safe_filename}.jpg"
+    else:
+        name       = _timestamp_name()
+        final_path = _replace_path(save_dir / f"{name}.flac")
+        art_path   = None
 
     try:
         audio = FLAC(temp_path)
@@ -87,7 +103,7 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
             audio["artist"] = [track.artist]
             audio["album"]  = [track.album]
 
-            if track.artwork_data:
+            if track.artwork_data and art_path:
                 pic = Picture()
                 pic.type = PictureType.COVER_FRONT
                 pic.mime = "image/jpeg"
@@ -97,7 +113,7 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
 
         audio.save()
         os.replace(temp_path, final_path)
-        print(f"[saved] {final_path.name}")
+        print(f"[saved] {final_path.relative_to(save_dir)}")
 
         if on_saved:
             try:
@@ -106,7 +122,8 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
                 pass
 
     except Exception as e:
-        fallback = save_dir / f"{base_name}_untagged.flac"
+        base_name = track.safe_filename if track else _timestamp_name()
+        fallback  = save_dir / f"{base_name}_untagged.flac"
         try:
             os.replace(temp_path, str(fallback))
         except Exception:
