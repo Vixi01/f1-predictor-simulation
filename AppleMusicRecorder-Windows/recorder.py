@@ -379,8 +379,8 @@ def _export_playlist(save_dir: str) -> Optional[Path]:
     from mutagen.flac import FLAC as _FLAC
     import soundfile as _sf
     folder = Path(save_dir)
-    flacs  = sorted(f for f in folder.rglob("*.flac")
-                    if "Artwork" not in f.parts and "_untagged" not in f.name)
+    flacs  = sorted(f for f in folder.glob("*.flac")
+                    if "_untagged" not in f.name)
     if not flacs:
         return None
     playlist_path = folder / "Apple Music Recordings.m3u"

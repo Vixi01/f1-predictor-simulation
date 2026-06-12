@@ -47,7 +47,7 @@ class RecordingDB:
         """
         safe = lambda s: "".join(c for c in s if c not in ':*?"<>|/\\').strip()
         save_dir = self._path.parent
-        expected = save_dir / safe(artist) / safe(album) / f"{safe(title)}.flac"
+        expected = save_dir / f"{safe(artist)} - {safe(album)} - {safe(title)}.flac"
         if expected.exists():
             return False, f"file already exists ({expected.name})"
         return True, "no recording found on disk"

@@ -45,10 +45,7 @@ def retag_untagged_file(untagged_path: Path, save_dir: Path, db=None) -> Optiona
         audio["artist"] = [artist]
         audio["album"]  = [album]
 
-        safe = lambda s: "".join(c for c in s if c not in r':*?"<>|/\\').strip()
-        track_dir = save_dir / safe(artist) / safe(album)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        final_path = _replace_path(track_dir / f"{safe(title)}.flac")
+        final_path = _replace_path(save_dir / f"{stem}.flac")
 
         art_dir  = save_dir / "Artwork"
         art_dir.mkdir(parents=True, exist_ok=True)
@@ -82,11 +79,7 @@ def _embed_and_rename(temp_path: str, track: Optional[TrackInfo],
     save_dir = Path(save_directory)
 
     if track:
-        safe = lambda s: "".join(c for c in s if c not in r':*?"<>|/\\').strip()
-        track_dir  = save_dir / safe(track.artist) / safe(track.album)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        safe_title = safe(track.title)
-        final_path = _replace_path(track_dir / f"{safe_title}.flac")
+        final_path = _replace_path(save_dir / f"{track.safe_filename}.flac")
         art_dir    = save_dir / "Artwork"
         art_dir.mkdir(parents=True, exist_ok=True)
         art_path   = art_dir / f"{track.safe_filename}.jpg"
