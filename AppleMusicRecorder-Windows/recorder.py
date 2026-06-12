@@ -212,21 +212,16 @@ def _finalize(temp_path: str, track: TrackInfo, was_interrupted: bool):
         metadata_writer.process(temp_path, track, SAVE_DIR,
                                 on_saved=lambda final: _on_saved(track, final, recorded_sec, expected_sec))
     else:
-        # Keep but flag incomplete so we re-record next time
+        # Discard the partial file — DB already marks it for re-recording
         try:
-            import soundfile as sf
-            import uuid
-            incomplete_name = f"{track.safe_filename}_incomplete_{uuid.uuid4().hex[:6]}.flac"
-            incomplete_path = str(Path(SAVE_DIR) / incomplete_name)
-            import shutil
-            shutil.move(temp_path, incomplete_path)
+            os.remove(temp_path)
         except Exception:
-            incomplete_path = temp_path
+            pass
         if _db:
             _db.mark_incomplete(track.artist, track.album, track.title,
-                                 incomplete_path, reason, recorded_sec, expected_sec)
-        print(f"[verify] INCOMPLETE — {reason}")
-        _notify(f"Incomplete recording: {track.title}\n{reason}\nWill re-record next time it plays.")
+                                 "", reason, recorded_sec, expected_sec)
+        print(f"[verify] INCOMPLETE — {reason} — discarded, will re-record")
+        _notify(f"Incomplete: {track.title}\n{reason}\nWill re-record next time it plays.")
 
 
 def _on_saved(track: TrackInfo, final_path: str, recorded_sec: float, expected_sec: float):
@@ -342,6 +337,18 @@ def _notify(message: str, title: str = "Apple Music Recorder"):
     if _tray_icon:
         try:
             _tray_icon.notify(message, title)
+        except Exception:
+            pass
+
+
+def _cleanup_incomplete_files(save_dir: str):
+    """Delete any leftover *_incomplete_*.flac files from previous sessions."""
+    folder = Path(save_dir)
+    stale = list(folder.glob("*_incomplete_*.flac"))
+    for f in stale:
+        try:
+            f.unlink()
+            print(f"[cleanup] removed stale incomplete file: {f.name}")
         except Exception:
             pass
 
@@ -499,6 +506,7 @@ def main():
 
     _db = RecordingDB(SAVE_DIR)
 
+    _cleanup_incomplete_files(SAVE_DIR)
     _retry_untagged(SAVE_DIR)
 
     # Session guard runs silently — VB-Cable isolates recording so warnings
